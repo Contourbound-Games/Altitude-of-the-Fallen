@@ -2,13 +2,18 @@ import { GameObjects, Input, Scene, Textures } from 'phaser';
 import { clamp, type Point } from '../../core/geometry';
 import { inputDirection, walk, type Bounds, type WalkStep } from '../../core/movement';
 import { contourSegments, type Segment } from '../../core/terrain/contours';
+import { hazardAt, slideFrom, type HazardZone } from '../../core/hazards';
+import {
+    CORPSE_B, distanceToDrop, HUT, KAREL, ROCK_BAND, SHELF_ELEVATION, SHELF_HAZARDS, SHELF_INNER, SHELF_START, SHELF_WHITEOUT, TOWER
+} from '../../core/shelf';
 import { elevationAt, gridHeight, gridWidth } from '../../core/terrain/elevation';
 import { snowLight, surfaceForm } from '../../core/terrain/surface';
-import { WORLD_ELEVATION } from '../../core/terrain/worldElevation';
-import { angularOffset, bearingOf, bearingTo, coarseReading, readingStep, relativeBearing, surveyReading, wholeBearing, type Reading } from '../../core/survey';
+import { angularOffset, bearingOf, bearingTo, coarseReading, readingStep, relativeBearing, SURVEY_RANGE_FACTOR, surveyReading, wholeBearing, type Reading } from '../../core/survey';
 import { fitMap, rayExit, toMap, type MapLayout } from '../../core/plotting';
-import { bearingVector, reverseBearing, triangulate } from '../../core/triangulation';
+import { bearingVector, bestPair, fixRegion, reverseBearing, triangulate } from '../../core/triangulation';
 import { lookAt, nextFacing, sightDistance, VIEW_CONE_ANGLE, visibility, type Look } from '../../core/visibility';
+import { RunLog } from './runLog';
+import { shelfAudio } from './shelfAudio';
 
 const ELEVATION_TEXTURE = 'field-elevation';
 /** Debug shading: elevation 0 draws as LOW_SHADE grey, elevation 1 as HIGH_SHADE. */
@@ -20,11 +25,10 @@ const HIGH_SHADE = 232;
  * exactly through a sample. Spacing between neighbouring lines is (1/9) / slope.
  */
 const CONTOUR_LEVELS = Array.from({ length: 9 }, (_, k) => (k + 0.5) / 9);
-/** Odd, so no lattice point lands exactly on a half level of this field (6.7px lattice). */
 const CONTOUR_SUBDIVISIONS = 9;
 const CONTOUR_COLOR = 0x20b8ff;
-/** The summit is everything inside the innermost contour ring (the highest contour level). */
-const SUMMIT_ELEVATION = CONTOUR_LEVELS[CONTOUR_LEVELS.length - 1];
+/** The world everything below is drawn from: the vertical-slice leg (see core/shelf.ts). */
+const WORLD_ELEVATION = SHELF_ELEVATION;
 
 /**
  * A pixel's paint: an opaque colour, or [colour, alpha] for pixels that let the snow show through
@@ -71,8 +75,11 @@ const DRIFTED_SNOW: Paint = [0xeef1f3, 0.9];
 const DRIFT_SHADE: Paint = [0x8a9bb0, 0.3];
 
 /**
- * The two prototype landmarks: two fallen climbers, told apart by pose first and by one saturated
- * colour among muted ones second.
+ * The slice's three landmarks: one ordinary (the rock tower, reachable, the safe reset point) and
+ * two fallen climbers, told apart by pose first and by one saturated colour among muted ones second.
+ *
+ * The tower is dark rock (R, shaded r) with snow lodged on its north-west faces (S); through the
+ * instrument it is the only tall, narrow spire on the horizon.
  *
  * Karel lies face down with his head to the west: grey helmet (H, shaded h), dark jacket (J, j)
  * under a muted pack (P), dark gloves (W) and trousers (L). His right arm is crooked up over his
@@ -88,12 +95,38 @@ const DRIFT_SHADE: Paint = [0x8a9bb0, 0.3];
  * where Karel is long and sprawled; the orange pack is its only saturated colour. Through the
  * instrument it is a short, rounded hump capped with orange.
  *
- * Each radius is the half-length of the original prototype sprite, so aiming is unchanged.
+ * Each corpse's radius is the half-length of the original prototype sprite, so aiming is unchanged.
  */
-const LANDMARKS: readonly [SurveyLandmark, SurveyLandmark] = [
+const LANDMARKS: readonly SurveyLandmark[] = [
+    {
+        label: 'TOWER',
+        position: TOWER,
+        pixels: [
+            '...RRr....',
+            '..RSRRr...',
+            '.RSSRRRrc.',
+            '.RSRRRRrcc',
+            '.RRRRRrrcc',
+            '..RRRrrcc.',
+            '...rrcc...'
+        ],
+        profile: [
+            '...R...',
+            '..RR...',
+            '..RSR..',
+            '.RRRr..',
+            '.RSRRr.',
+            '.RRRRr.',
+            'RRRRRrr',
+            'SSSSSSS'
+        ],
+        colors: { R: 0x5a5650, r: 0x3f3c38, S: DRIFTED_SNOW, c: CONTACT_SHADOW },
+        mapColor: 0x4a4640,
+        radius: 4
+    },
     {
         label: 'KAREL',
-        position: { x: 730, y: 510 },
+        position: KAREL,
         pixels: [
             '..WWJJ..................',
             '...cccJ.................',
@@ -123,7 +156,7 @@ const LANDMARKS: readonly [SurveyLandmark, SurveyLandmark] = [
     },
     {
         label: 'CORPSE B',
-        position: { x: 790, y: 590 },
+        position: CORPSE_B,
         pixels: [
             '...KKKF.........',
             '..KKKFfF........',
@@ -161,14 +194,14 @@ const LANDMARKS: readonly [SurveyLandmark, SurveyLandmark] = [
 ];
 
 /**
- * The destination: a small emergency shelter at a known map position. It is drawn like a landmark
- * (under the fog, so it is seen exactly as much as the ground there) but is deliberately not in
- * LANDMARKS, so it can never be surveyed. Muted, low-contrast colours: identifiable only up close.
- * R roof, W wall, D door.
+ * The destination: a small buried hut at a known map position. It is drawn like a landmark and
+ * fades in only as close as they do (see LANDMARK_FIELD_RANGE), but is deliberately not in
+ * LANDMARKS, so it can never be surveyed: the last leg is walked from a fix. Muted, low-contrast
+ * colours. R roof, W wall, D door.
  */
 const SHELTER: Landmark = {
-    label: 'SHELTER',
-    position: { x: 1340, y: 700 },
+    label: 'HUT',
+    position: HUT,
     pixels: [
         '..RRRRRR..',
         '.RRRRRRRR.',
@@ -180,13 +213,13 @@ const SHELTER: Landmark = {
     colors: { R: 0x6e6254, W: 0x4c443c, D: 0x26221e },
     mapColor: 0x6b4a2a
 };
-/** Within this distance of the shelter's centre (world px) the player has reached it. */
+/** Within this distance of the hut's centre (world px) the player has reached it. */
 const SHELTER_REACH = 10;
 
 /**
- * In the top-down field Karel and Corpse B are drawn only this close (world px), so the field cannot
- * be used as a rangefinder: from further off they are observed in the Survey View, by bearing only.
- * Standing this close to a known landmark is allowed to tell the player roughly where they are.
+ * In the top-down field the landmarks and the hut are drawn only this close (world px), so the field
+ * cannot be used as a rangefinder: from further off landmarks are observed in the Survey View, by
+ * bearing only. Standing this close to a known landmark is allowed to tell the player where they are.
  *
  * They fade in rather than appear: invisible beyond LANDMARK_FIELD_RANGE, fully drawn within
  * LANDMARK_FIELD_SOLID, and in between as opaque as the distance is far into that band. The fog
@@ -199,9 +232,9 @@ const LANDMARK_FIELD_SOLID = 34;
  * Survey View (SPACE held): the horizon seen through the survey instrument's eyepiece, around the
  * instrument's azimuth. A landmark is drawn at the horizontal position of its bearing relative to
  * that azimuth (see angularOffset), at its one fixed size, as opaque as it is visible, so it fades
- * out smoothly with distance. It sees SURVEY_RANGE_FACTOR times as far as the field under the same whiteout, and
- * reads fainter landmarks more coarsely (see surveyReading). In light whiteout that is 234px, so no
- * start candidate (all 277px or more from both landmarks) has a landmark in sight.
+ * out smoothly with distance. It sees SURVEY_RANGE_FACTOR times as far as the field under the same
+ * whiteout, and reads fainter landmarks more coarsely (see surveyReading). In the slice's light
+ * whiteout that is 234px, so the start has no landmark in sight (see core/shelf.test.ts).
  *
  * The instrument turns like one: horizontal mouse movement turns it SURVEY_DEGREES_PER_PIXEL per
  * game pixel (mouse height does nothing), and the left/right movement keys turn it continuously at
@@ -209,7 +242,6 @@ const LANDMARK_FIELD_SOLID = 34;
  */
 const SURVEY_DEGREES_PER_PIXEL = 0.25;
 const SURVEY_TURN_RATE = 120;
-const SURVEY_RANGE_FACTOR = 1.75;
 const SURVEY_VIEW_FOV = VIEW_CONE_ANGLE * 180 / Math.PI;
 
 /**
@@ -249,30 +281,93 @@ const MAP_GRID_STEP = 120;
  * degree when the step is fractional and the reading was then rounded to whole degrees.
  */
 const readingHalfWidth = (reading: Reading) => reading.step / 2 + (Number.isInteger(reading.step) ? 0 : 0.5);
-/** The last survey fix: a hollow red ring, so the crossing of the lines stays visible inside it. */
+/** One decimal place, for the run log. */
+const round = (value: number) => Math.round(value * 10) / 10;
+
+/** Traces a closed polygon as the graphics' current path. */
+function tracePolygon (g: GameObjects.Graphics, points: readonly Point[])
+{
+    g.beginPath();
+    g.moveTo(points[0].x, points[0].y);
+    points.slice(1).forEach(point => g.lineTo(point.x, point.y));
+    g.closePath();
+}
+
+const fillPolygon = (g: GameObjects.Graphics, points: readonly Point[]) => { tracePolygon(g, points); g.fillPath(); };
+const strokePolygon = (g: GameObjects.Graphics, points: readonly Point[]) => { tracePolygon(g, points); g.strokePath(); };
+
+/**
+ * Hatching for a polygon: segments of the diagonal lines x + y = c, `spacing` px apart (measured
+ * across them), clipped to the polygon (even-odd: pairs of crossings along each line).
+ */
+function hatch (polygon: readonly Point[], spacing: number): [Point, Point][]
+{
+    const sums = polygon.map(p => p.x + p.y);
+    const segments: [Point, Point][] = [];
+    const step = spacing * Math.SQRT2;
+
+    for (let c = Math.min(...sums) + step / 2; c < Math.max(...sums); c += step)
+    {
+        const crossings: Point[] = [];
+
+        polygon.forEach((a, i) => {
+            const b = polygon[(i + 1) % polygon.length];
+            const fa = a.x + a.y - c;
+            const fb = b.x + b.y - c;
+
+            if ((fa < 0) !== (fb < 0))
+            {
+                const t = fa / (fa - fb);
+
+                crossings.push({ x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t });
+            }
+        });
+
+        crossings.sort((p, q) => p.x - q.x);
+
+        for (let i = 0; i + 1 < crossings.length; i += 2)
+        {
+            segments.push([crossings[i], crossings[i + 1]]);
+        }
+    }
+
+    return segments;
+}
+/**
+ * The last survey fix, drawn as the region where the two readings' wedges overlap (see fixRegion),
+ * so a coarse fix looks as uncertain as it is; the crossing of the lines stays visible inside it.
+ */
 const FIX_MARK_COLOR = 0xd01818;
-const FIX_MARK_RADIUS = 4;
+/** Map hazards: slide zones hatched in blue-grey, the drop beyond the walkable ground in dark ink. */
+const MAP_SLIDE_COLOR = 0x5d7aa0;
+const MAP_DROP_COLOR = 0x3a3330;
+const MAP_HATCH_STEP = 6;
+/** Debrief: the true track in red ink, slides in blue, recall marks as pencil crosses. */
+const TRACK_COLOR = 0xc0301e;
+const SLIDE_TRACK_COLOR = 0x2f5fa8;
+const RECALL_COLOR = 0x2a2a2a;
+/** The moments the facilitator asks about after a run (TAB cycles; a click marks the player's belief). */
+const RECALL_MOMENTS = ['route decision', 'traverse entry / bend', 'just after the slide', 'start of final approach', 'other'];
 
 const FOG_TEXTURE = 'visibility-fog';
 /** Fog is painted at 1/FOG_SCALE resolution and scaled up, so each fog cell is FOG_SCALE px square. */
 const FOG_SCALE = 2;
 /** Snow-blue, so obscured ground reads as weather rather than as dark or high terrain. */
 const FOG_RGB = [176, 194, 214];
-/** Whiteout set by the debug keys 0-4. */
+/** Whiteout set by the debug keys 0-4 (development builds only, see DEV). */
 const WHITEOUT_LEVELS = [0, 0.25, 0.5, 0.75, 1];
 
 /**
- * A fresh run starts at one of these places, chosen at random, so the player does not know where
- * they are. None has a landmark or the shelter in sight, none is in the area where both landmarks
- * can be surveyed, and each is at least 120px from the walkable edge. Headings to the shelter:
- * 84, 114, 141 and 214 degrees. `?spawn=N` (0-3) picks one for testing.
+ * `?dev` in the URL enables the development view and its keys (H, E, C, V, 0-4) and the log
+ * download. Without it the player view is all there is: no position readout, no weather keys.
  */
-const START_CANDIDATES: readonly Point[] = [
-    { x: 500, y: 780 },
-    { x: 520, y: 330 },
-    { x: 1040, y: 330 },
-    { x: 1460, y: 520 }
-];
+const DEV = new URLSearchParams(window.location.search).has('dev');
+/** Walkable ground beyond which the mountain drops away, darkened in the field. */
+const DROP_RGB = [52, 60, 74];
+/** Within this distance (px) of the drop the wind rises to a roar (see ShelfAudio). */
+const DROP_WARNING = 80;
+/** A slide plays at this speed (px/s) along its path; the player has no control meanwhile. */
+const SLIDE_SPEED = 160;
 /**
  * Player view snow: shaped by the ground's local form only, never by how high it is (see
  * surfaceForm), so level snow looks the same at any altitude. The elevation shading is a
@@ -301,22 +396,22 @@ const SNOW_CURVATURE = 0.00002;
 const SNOW_CELL = 2;
 const SNOW_FIELD_TEXTURE = 'snow-field';
 /**
- * Faint specks and short wind streaks repeated every SNOW_TILE px across the world, over the
- * shaded snow, so the ground visibly moves as the player walks (and stops moving against an edge).
- * Identical in every tile: it shows motion, never position.
+ * The rock band takes an even rock cast over its shading where its face is steep: none below a
+ * slope of ROCK_STEEP_FROM, full ROCK_COVER from ROCK_STEEP_FULL, so its outline follows the ground.
+ * It also fades across the band's sides (ROCK_FADE_X wide) and top and bottom (ROCK_FADE_Y), so it
+ * reads as rock emerging from the snow rather than a painted strip. Deliberately no small marks
+ * anywhere on the ground (specks, streaks, scattered rocks): fixed in the world, they would be
+ * fingerprints of a place, and repeating they would count distance like an odometer.
  */
-const SNOW_TEXTURE = 'snow-speckle';
-const SNOW_TILE = 96;
-const SNOW_SPECKS = [[5, 7], [19, 83], [57, 22], [71, 56], [23, 44], [88, 9], [40, 69], [8, 61], [62, 90], [35, 15], [81, 38], [50, 51]];
-const SNOW_SPECK_COLOR = 'rgba(112, 130, 150, 0.4)';
-/** Streaks: [x, y, length], drawn along the prevailing wind (from the west). */
-const SNOW_STREAKS = [[3, 27, 9], [46, 6, 6], [60, 70, 11], [12, 84, 5], [30, 53, 7], [74, 31, 8]];
-const SNOW_STREAK_COLOR = 'rgba(255, 255, 255, 0.4)';
-const START_WHITEOUT = WHITEOUT_LEVELS[1];
+const ROCK_RGB = [88, 84, 78];
+const ROCK_COVER = 0.55;
+const ROCK_STEEP_FROM = 0.0018;
+const ROCK_STEEP_FULL = 0.003;
+const ROCK_FADE_X = 60;
+const ROCK_FADE_Y = 30;
+const START_WHITEOUT = SHELF_WHITEOUT;
 /** How long a short notice (e.g. "bearings cleared") stays in the panel. */
 const NOTICE_MS = 3000;
-const SUMMIT_NOTICE_MS = 6000;
-const SHELTER_NOTICE_MS = 6000;
 
 
 /** Even size so the centred marker lands on whole pixels. */
@@ -327,7 +422,22 @@ const FLAT_SLOPE = 1e-9;
 type MoveKeys = Record<'left' | 'right' | 'up' | 'down', Input.Keyboard.Key[]>;
 
 /**
- * Test field: a player marker moving over the elevation field, with a debug readout.
+ * playing: walking and surveying. sliding: carried down a slide's path, no control. recall: the run
+ * is over and the map is shown without the true track while the facilitator asks where the player
+ * believed they were. debrief: the map with the true track.
+ */
+type Phase = 'playing' | 'sliding' | 'recall' | 'debrief';
+
+/** A recorded fix: where the lines crossed, and the region the readings' uncertainty allows. */
+interface Fix
+{
+    readonly point: Point;
+    readonly region: Point[] | null;
+}
+
+/**
+ * The vertical-slice leg "The Shelf" (see core/shelf.ts): a player marker moving over the leg's
+ * terrain with the Survey View, the map, the hazards and the playtest log.
  * The world is larger than the screen; the camera stays centred on the player.
  */
 export class FieldScene extends Scene
@@ -353,24 +463,35 @@ export class FieldScene extends Scene
     /** Where the map draws the world (uniform scale, see fitMap). */
     private mapLayout: MapLayout;
     /**
-     * Where the last accepted two-bearing fix placed the player when they took the bearings. Written
-     * onto the map and kept when the player moves; only a new accepted fix replaces it.
+     * Where the last accepted fix placed the player when they took the bearings. Written onto the map
+     * and kept when the player moves; only a new accepted fix replaces it.
      */
-    private savedFix: Point | null;
-    /** Whether the summit has been reached this run (acknowledged once). */
-    private summitReached: boolean;
-    /** Whether the shelter has been reached this run (acknowledged once). */
-    private shelterReached: boolean;
-    /** Which of START_CANDIDATES this run started at (development view only). */
-    private startIndex: number;
+    private savedFix: Fix | null;
+    /** Every accepted fix this run, for the debrief. */
+    private fixes: Fix[];
+    private phase: Phase;
+    /** The slide in progress: its path and how far along it (px) the player has been carried. */
+    private slide: { path: readonly Point[]; travelled: number; fatal: boolean } | null;
+    /** Snow spray drawn round the player while sliding. */
+    private spray: GameObjects.Graphics;
+    /** The hut's field drawing, faded in like the landmarks. */
+    private hutSprite: GameObjects.Graphics;
+    /** How the run ended. */
+    private ending: 'arrived' | 'fell' | null;
+    /** Scene time (ms) the run started at; log times are measured from it. */
+    private startTime: number;
+    private log: RunLog;
+    /** Recall: the moment currently being asked about, and the player's mark for each moment. */
+    private recallMoment: number;
+    private recallMarks: Map<string, Point>;
     /** Contour lines of the terrain, shared by the development overlay and the map. */
     private contourLines: Segment[];
     /** A short message for the panel, shown until the given scene time. */
     private notice: { text: string; until: number } | null;
     /** Whether any bearing has been recorded this run (the opening "Lost" hint is shown only before). */
     private everRecorded: boolean;
-    /** Recorded whole-degree bearings to LANDMARKS[0] and [1], from the current position only. */
-    private readings: [Reading | null, Reading | null];
+    /** Recorded readings of each of LANDMARKS (by index), from the current position only. */
+    private readings: (Reading | null)[];
     /** The instrument's azimuth while surveying (null otherwise), and the mouse x it was last turned from. */
     private surveyAzimuth: number | null;
     private surveyPointerX: number;
@@ -442,19 +563,15 @@ export class FieldScene extends Scene
         // screen says nothing about where it is in the world.
         this.bounds = { minX: view.width / 2, minY: view.height / 2, maxX: width - view.width / 2, maxY: height - view.height / 2 };
         this.cameras.main.setBounds(0, 0, width, height);
-        const requested = Number.parseInt(new URLSearchParams(window.location.search).get('spawn') ?? '', 10);
-
-        this.startIndex = requested >= 0 && requested < START_CANDIDATES.length
-            ? requested
-            : Math.floor(Math.random() * START_CANDIDATES.length);
-        this.position = { ...START_CANDIDATES[this.startIndex] };
+        // The player is never told where this is; the slice always starts here (see core/shelf.ts).
+        this.position = { ...SHELF_START };
         this.cameras.main.setBackgroundColor(SNOW_COLOR);
         this.facing = { x: 0, y: -1 };
         this.lookWithPointer = false;
         this.pointerMoved = false;
         this.lookTarget = { x: NaN, y: NaN };
         this.lookHeld = false;
-        this.readings = [null, null];
+        this.readings = LANDMARKS.map(() => null);
         this.surveyAzimuth = null;
         this.surveyPointerX = 0;
         this.lastSurvey = null;
@@ -462,8 +579,14 @@ export class FieldScene extends Scene
         this.notice = null;
         this.everRecorded = false;
         this.savedFix = null;
-        this.summitReached = false;
-        this.shelterReached = false;
+        this.fixes = [];
+        this.phase = 'playing';
+        this.slide = null;
+        this.ending = null;
+        this.startTime = this.time.now;
+        this.log = new RunLog();
+        this.recallMoment = 0;
+        this.recallMarks = new Map();
         this.whiteout = START_WHITEOUT;
         this.debugView = false;
         this.showShading = true;
@@ -476,7 +599,8 @@ export class FieldScene extends Scene
         this.shading = this.drawElevation(width, height).setVisible(false);
         this.contours = this.drawContours();
         this.landmarkSprites = LANDMARKS.map(landmark => this.drawLandmark(landmark));
-        this.drawLandmark(SHELTER);
+        this.hutSprite = this.drawLandmark(SHELTER);
+        this.spray = this.add.graphics();
 
         this.createFog(view.width, view.height);
 
@@ -493,22 +617,71 @@ export class FieldScene extends Scene
             padding: { x: 3, y: 2 }
         }).setOrigin(0.5, 1).setScrollFactor(0).setDepth(11).setVisible(false);
 
-        // H: development view <-> player view. E/C/V only act in the development view.
-        // E = elevation shading, C = contour lines, V = view limit; 0-4 = whiteout in both views.
-        keyboard.on('keydown-H', () => this.debugView = !this.debugView);
-        keyboard.on('keydown-E', () => { if (this.debugView) this.showShading = !this.showShading; });
-        keyboard.on('keydown-C', () => { if (this.debugView) this.showContours = !this.showContours; });
-        keyboard.on('keydown-V', () => { if (this.debugView) this.viewLimited = !this.viewLimited; });
-        keyboard.on('keydown-M', () => this.mapOpen = !this.mapOpen);
-        ['ZERO', 'ONE', 'TWO', 'THREE', 'FOUR'].forEach((name, level) => {
-            keyboard.on(`keydown-${name}`, () => this.whiteout = WHITEOUT_LEVELS[level]);
+        // Development builds only (?dev): H switches to the development view, where E/C/V act;
+        // E = elevation shading, C = contour lines, V = view limit; 0-4 = whiteout.
+        if (DEV)
+        {
+            keyboard.on('keydown-H', () => this.debugView = !this.debugView);
+            keyboard.on('keydown-E', () => { if (this.debugView) this.showShading = !this.showShading; });
+            keyboard.on('keydown-C', () => { if (this.debugView) this.showContours = !this.showContours; });
+            keyboard.on('keydown-V', () => { if (this.debugView) this.viewLimited = !this.viewLimited; });
+            ['ZERO', 'ONE', 'TWO', 'THREE', 'FOUR'].forEach((name, level) => {
+                keyboard.on(`keydown-${name}`, () => this.whiteout = WHITEOUT_LEVELS[level]);
+            });
+        }
+
+        keyboard.on('keydown', () => shelfAudio.unlock());
+        keyboard.on('keydown-M', () => {
+            if (this.phase === 'playing')
+            {
+                this.mapOpen = !this.mapOpen;
+                this.logEvent(this.mapOpen ? 'map-open' : 'map-close');
+            }
+        });
+        // After the run: TAB picks the moment being recalled, ENTER reveals the debrief,
+        // R starts again, L saves the run log.
+        keyboard.on('keydown-TAB', (event: KeyboardEvent) => {
+            event.preventDefault();
+
+            if (this.phase === 'recall')
+            {
+                this.recallMoment = (this.recallMoment + 1) % RECALL_MOMENTS.length;
+            }
+        });
+        keyboard.on('keydown-ENTER', () => {
+            if (this.phase === 'recall')
+            {
+                this.phase = 'debrief';
+                this.logEvent('debrief');
+            }
+        });
+        keyboard.on('keydown-R', () => {
+            if (this.phase === 'debrief')
+            {
+                this.scene.restart();
+            }
+        });
+        keyboard.on('keydown-L', () => {
+            if (this.phase === 'debrief' || DEV)
+            {
+                this.log.download();
+            }
         });
 
         // Click while surveying records the reading of the landmark being aimed at. Phaser runs this
         // as soon as the DOM event arrives, between frames, so the aim is worked out from the pointer
         // as it is now rather than taken from the last update (which may predate this move).
-        this.input.on(Input.Events.POINTER_DOWN, () => {
-            if (!this.surveyKey.isDown || this.mapOpen)
+        // During recall a click on the map marks where the player believed they were.
+        this.input.on(Input.Events.POINTER_DOWN, (pointer: Input.Pointer) => {
+            shelfAudio.unlock();
+
+            if (this.phase === 'recall')
+            {
+                this.markRecall(pointer);
+                return;
+            }
+
+            if (this.phase !== 'playing' || !this.surveyKey.isDown || this.mapOpen)
             {
                 return;
             }
@@ -519,13 +692,20 @@ export class FieldScene extends Scene
             {
                 this.readings[aimed.index] = aimed.reading;
                 this.everRecorded = true;
+                this.logEvent('reading', { landmark: LANDMARKS[aimed.index].label, bearing: aimed.reading.bearing, step: round(aimed.reading.step) });
 
-                // Two bearings that cross well are written onto the map; a rejected pair keeps the old fix.
+                // Readings that cross well are written onto the map; a rejected set keeps the old fix.
                 const fix = this.positionFix();
 
                 if (fix)
                 {
                     this.savedFix = fix;
+                    this.fixes.push(fix);
+                    this.logEvent('fix', { x: round(fix.point.x), y: round(fix.point.y), error: round(Math.hypot(fix.point.x - this.position.x, fix.point.y - this.position.y)) });
+                }
+                else if (fix === null)
+                {
+                    this.logEvent('fix-rejected');
                 }
             }
         });
@@ -578,11 +758,34 @@ export class FieldScene extends Scene
         this.followPlayer();
         this.showState(this.position);
         this.paintFog();
+        this.log.sample(0, this.position, true);
+        this.logEvent('start', { x: this.position.x, y: this.position.y });
+
+        if (DEV)
+        {
+            // Development only: the current run's log, for inspection from the browser console.
+            (window as unknown as { shelfLog: RunLog }).shelfLog = this.log;
+        }
     }
 
     update (time: number, delta: number)
     {
         this.showMap();
+
+        if (this.phase === 'recall' || this.phase === 'debrief')
+        {
+            return;
+        }
+
+        const seconds = delta / 1000;
+
+        if (this.phase === 'sliding')
+        {
+            this.advanceSlide(seconds);
+            this.revealNearby();
+            this.paintFog();
+            return;
+        }
 
         if (this.mapOpen)
         {
@@ -593,7 +796,6 @@ export class FieldScene extends Scene
         }
 
         const held = (keys: Input.Keyboard.Key[]) => keys.some(key => key.isDown);
-        const seconds = delta / 1000;
         const surveying = this.surveyKey.isDown;
 
         if (!surveying)
@@ -601,6 +803,7 @@ export class FieldScene extends Scene
             if (this.surveyAzimuth !== null)
             {
                 this.lastSurvey = { position: this.position, azimuth: this.surveyAzimuth };
+                this.logEvent('survey-close');
             }
 
             this.surveyAzimuth = null;
@@ -613,6 +816,7 @@ export class FieldScene extends Scene
 
             this.surveyAzimuth = unmoved ? last.azimuth : bearingOf(this.facing) ?? 0;
             this.surveyPointerX = this.input.activePointer.x;
+            this.logEvent('survey-open');
         }
         else
         {
@@ -646,20 +850,33 @@ export class FieldScene extends Scene
                 };
             }
 
-            this.readings = [null, null];
+            this.readings = LANDMARKS.map(() => null);
         }
 
-        if (!this.summitReached && elevationAt(WORLD_ELEVATION, this.position.x, this.position.y) >= SUMMIT_ELEVATION)
+        this.log.sample(this.elapsed(), this.position);
+
+        // The map's hazards: the drop ends the run, the slab carries the player down it.
+        const hazard = hazardAt(SHELF_HAZARDS, this.position);
+
+        if (hazard?.kind === 'fatal')
         {
-            this.summitReached = true;
-            this.notice = { text: 'SUMMIT REACHED', until: time + SUMMIT_NOTICE_MS };
+            this.endRun('fell');
+            return;
         }
 
-        if (!this.shelterReached && Math.hypot(this.position.x - SHELTER.position.x, this.position.y - SHELTER.position.y) <= SHELTER_REACH)
+        if (hazard?.kind === 'slide')
         {
-            this.shelterReached = true;
-            this.notice = { text: 'SHELTER REACHED', until: time + SHELTER_NOTICE_MS };
+            this.startSlide(hazard);
+            return;
         }
+
+        if (Math.hypot(this.position.x - SHELTER.position.x, this.position.y - SHELTER.position.y) <= SHELTER_REACH)
+        {
+            this.endRun('arrived');
+            return;
+        }
+
+        shelfAudio.setWind(clamp(1 - distanceToDrop(this.position) / DROP_WARNING, 0, 1));
 
         if (this.notice && time > this.notice.until)
         {
@@ -684,17 +901,153 @@ export class FieldScene extends Scene
         this.debugText.setVisible(this.debugView);
         this.shading.setVisible(this.debugView && this.showShading);
         this.contours.setVisible(this.debugView && this.showContours);
-        this.landmarkSprites.forEach((sprite, index) => {
-            const { x, y } = LANDMARKS[index].position;
-
-            const distance = Math.hypot(x - this.position.x, y - this.position.y);
-            const reveal = this.debugView ? 1 : clamp((LANDMARK_FIELD_RANGE - distance) / (LANDMARK_FIELD_RANGE - LANDMARK_FIELD_SOLID), 0, 1);
-
-            sprite.setVisible(reveal > 0).setAlpha(reveal);
-        });
+        this.revealNearby();
         this.showState(previous, step, seconds);
         this.paintFog();
         this.showSurvey();
+    }
+
+    /** Milliseconds since this run started: the time base of the run log. */
+    private elapsed (): number
+    {
+        return this.time.now - this.startTime;
+    }
+
+    private logEvent (type: string, data: Record<string, unknown> = {})
+    {
+        this.log.event(this.elapsed(), type, data);
+    }
+
+    /** Fades the landmarks and the hut in with distance (see LANDMARK_FIELD_RANGE). */
+    private revealNearby ()
+    {
+        const reveal = (sprite: GameObjects.Graphics, { x, y }: Point) => {
+            const distance = Math.hypot(x - this.position.x, y - this.position.y);
+            const alpha = this.debugView ? 1 : clamp((LANDMARK_FIELD_RANGE - distance) / (LANDMARK_FIELD_RANGE - LANDMARK_FIELD_SOLID), 0, 1);
+
+            sprite.setVisible(alpha > 0).setAlpha(alpha);
+        };
+
+        this.landmarkSprites.forEach((sprite, index) => reveal(sprite, LANDMARKS[index].position));
+        reveal(this.hutSprite, SHELTER.position);
+    }
+
+    /**
+     * The player has stepped onto the slab: work out where it carries them (see slideFrom) and hand
+     * control to the slide. Readings are cleared like any other move; the last fix stays.
+     */
+    private startSlide (zone: HazardZone)
+    {
+        const slide = slideFrom(WORLD_ELEVATION, SHELF_HAZARDS, this.position);
+        const length = (slide.path.length - 1) * 2;
+
+        this.phase = 'sliding';
+        this.slide = { path: slide.path, travelled: 0, fatal: slide.fatal };
+        this.mapOpen = false;
+        this.surveyAzimuth = null;
+        this.readings = LANDMARKS.map(() => null);
+        this.surveyView.setVisible(false);
+        this.surveyAzText.setVisible(false);
+        this.surveyText.setVisible(false);
+        this.cameras.main.shake(250, 0.004);
+        shelfAudio.slide(Math.max(0.6, length / SLIDE_SPEED));
+        this.logEvent('slide-start', { x: round(this.position.x), y: round(this.position.y), zone: zone.kind });
+    }
+
+    /** Carries the player along the slide's path; on landing, hands control back (or ends the run). */
+    private advanceSlide (seconds: number)
+    {
+        const slide = this.slide;
+
+        if (!slide)
+        {
+            return;
+        }
+
+        slide.travelled += SLIDE_SPEED * seconds;
+
+        // Path points are 2px apart (see slideFrom).
+        const index = Math.min(slide.path.length - 1, Math.floor(slide.travelled / 2));
+
+        this.position = slide.path[index];
+        this.followPlayer();
+        this.marker.setPosition(Math.round(this.position.x), Math.round(this.position.y));
+        this.log.sample(this.elapsed(), this.position);
+
+        // Snow thrown up round the player.
+        this.spray.clear();
+        this.spray.fillStyle(0xffffff, 0.8);
+
+        for (let i = 0; i < 14; i++)
+        {
+            const angle = Math.random() * Math.PI * 2;
+            const distance = 4 + Math.random() * 10;
+
+            this.spray.fillRect(Math.round(this.position.x + Math.cos(angle) * distance), Math.round(this.position.y + Math.sin(angle) * distance), 2, 2);
+        }
+
+        if (index < slide.path.length - 1)
+        {
+            return;
+        }
+
+        this.spray.clear();
+        this.slide = null;
+        this.logEvent('slide-end', {
+            x: round(this.position.x),
+            y: round(this.position.y),
+            path: slide.path.filter((_, i) => i % 5 === 0).map(point => [round(point.x), round(point.y)])
+        });
+
+        if (slide.fatal)
+        {
+            this.endRun('fell');
+            return;
+        }
+
+        this.phase = 'playing';
+        this.notice = { text: 'You slid down the slope.', until: this.time.now + NOTICE_MS };
+    }
+
+    /** The run is over: hold the field and open the map for recall, before the debrief. */
+    private endRun (ending: 'arrived' | 'fell')
+    {
+        this.ending = ending;
+        this.phase = 'recall';
+        this.mapOpen = true;
+        this.surveyAzimuth = null;
+        this.surveyView.setVisible(false);
+        this.surveyAzText.setVisible(false);
+        this.surveyText.setVisible(false);
+        this.log.sample(this.elapsed(), this.position, true);
+        this.logEvent(ending === 'arrived' ? 'arrive' : 'fall', { x: round(this.position.x), y: round(this.position.y) });
+
+        if (ending === 'arrived')
+        {
+            shelfAudio.arrive();
+        }
+        else
+        {
+            shelfAudio.fall();
+            this.cameras.main.shake(400, 0.01);
+        }
+    }
+
+    /** Recall: a click on the map marks where the player believed they were at the current moment. */
+    private markRecall (pointer: Input.Pointer)
+    {
+        const { x, y, scale } = this.mapLayout;
+        const point = { x: (pointer.x - x) / scale, y: (pointer.y - y) / scale };
+
+        if (point.x < 0 || point.y < 0 || point.x > gridWidth(WORLD_ELEVATION) || point.y > gridHeight(WORLD_ELEVATION))
+        {
+            return;
+        }
+
+        const moment = RECALL_MOMENTS[this.recallMoment];
+
+        this.recallMarks.set(moment, point);
+        this.logEvent('recall-mark', { moment, x: round(point.x), y: round(point.y) });
     }
 
     /**
@@ -738,22 +1091,22 @@ export class FieldScene extends Scene
         {
             lines.push(this.everRecorded
                 ? 'SPACE + click: take a bearing.  M: map'
-                : 'Lost. Find two landmarks. SPACE + click: take a bearing.  M: map');
+                : 'Lost. Reach the HUT. SPACE + click: take a bearing.  M: map');
         }
         else if (recorded === 1)
         {
-            lines.push('Now take a bearing to the other landmark without moving.');
+            lines.push('Now take a bearing to another landmark without moving.');
         }
-        else if (recorded === 2)
+        else if (recorded >= 2)
         {
             lines.push(fix
-                ? 'Both bearings taken: your fix is marked on the map (M).'
-                : 'These two bearings are too close to parallel to fix your position here.');
+                ? 'Your fix is marked on the map (M).'
+                : 'These bearings are too close to parallel to fix your position here.');
         }
 
         if (fix !== undefined && this.debugView)
         {
-            lines.push(fix ? `FIX  ${fix.x.toFixed(1)}, ${fix.y.toFixed(1)}` : 'NO FIX  bearings too close or opposed');
+            lines.push(fix ? `FIX  ${fix.point.x.toFixed(1)}, ${fix.point.y.toFixed(1)}` : 'NO FIX  bearings too close or opposed');
         }
 
         this.surveyText.setVisible(lines.length > 0).setText(lines);
@@ -987,19 +1340,23 @@ export class FieldScene extends Scene
     }
 
     /**
-     * The map overlay while M is open: known landmarks, and for each recorded reading the line back
-     * from that landmark along the reverse bearing, with a faint wedge for the half-degree rounding.
-     * The player works out where the lines cross; only the development view shows the answer.
+     * The map overlay: paper, grid, contours, the hazards (the slab hatched, the drop in dark ink),
+     * the landmarks and the hut. While playing (M): each recorded reading's line back from its
+     * landmark along the reverse bearing, with a faint wedge for its uncertainty, and LAST FIX as the
+     * region the readings allow. The player works out where the lines cross; only the development
+     * view shows the answer. After the run: recall (the map with no true track, for the player's
+     * belief marks), then the debrief (the true track, the slides, every fix and the recall marks).
      */
     private showMap ()
     {
+        const open = this.mapOpen || this.phase === 'recall' || this.phase === 'debrief';
         const objects = [this.mapGraphics, this.mapLegend, this.mapDebug, this.mapFixLabel, ...this.mapLabels];
 
-        objects.forEach(object => object.setVisible(this.mapOpen));
-        this.mapDebug.setVisible(this.mapOpen && this.debugView);
-        this.mapFixLabel.setVisible(this.mapOpen && this.savedFix !== null);
+        objects.forEach(object => object.setVisible(open));
+        this.mapDebug.setVisible(open && this.debugView);
+        this.mapFixLabel.setVisible(open && this.phase === 'playing' && this.savedFix !== null);
 
-        if (!this.mapOpen)
+        if (!open)
         {
             return;
         }
@@ -1041,70 +1398,76 @@ export class FieldScene extends Scene
             line(a, b);
         }
 
-        const readingsLine: string[] = [];
+        this.drawMapHazards(at);
 
-        LANDMARKS.forEach((landmark, index) => {
-            const reading = this.readings[index];
-
-            if (reading === null)
-            {
-                readingsLine.push(`${landmark.label} no bearing`);
-                return;
-            }
-
-            const from = landmark.position;
-            const back = reverseBearing(reading.bearing);
-            const end = rayExit(from, back, bounds);
-            const left = rayExit(from, back - readingHalfWidth(reading), bounds);
-            const right = rayExit(from, back + readingHalfWidth(reading), bounds);
-
-            if (left && right)
-            {
-                const [a, b, c] = [at(from), at(left), at(right)];
-
-                g.fillStyle(landmark.mapColor, 0.2);
-                g.fillTriangle(a.x, a.y, b.x, b.y, c.x, c.y);
-            }
-
-            if (end)
-            {
-                g.lineStyle(1, landmark.mapColor);
-                line(from, end);
-            }
-
-            readingsLine.push(`${landmark.label} read ${degrees(reading.bearing)} -> line ${degrees(back)}`);
-        });
-
-        const fix = this.positionFix();
-        const recorded = this.readings.filter(reading => reading !== null).length;
         const legend = [
-            `MAP   M: back to the field      ${this.shelterReached ? 'Shelter reached.' : 'Goal: reach the SHELTER (hut symbol).'}`,
-            'Each coloured line runs back from its landmark towards where you stood.',
-            readingsLine.join('     ')
+            this.phase === 'playing'
+                ? 'MAP   M: back to the field      Goal: reach the HUT.   Hatched: slab, you will slide.   Dark: the drop.'
+                : this.ending === 'arrived' ? 'You reached the hut.' : 'You fell from the edge.'
         ];
 
-        if (recorded === 0)
+        if (this.phase === 'playing')
         {
-            legend.push(this.savedFix
-                ? 'No bearings from here. LAST FIX is where you stood when you took your last bearings, not where you are now.'
-                : 'No bearings yet: survey a landmark (SPACE + click) in the field.');
-        }
-        else if (recorded === 1)
-        {
-            legend.push('One line: you are somewhere along it. Take the other bearing from the same spot.');
-        }
-        else if (fix === null)
-        {
-            legend.push(this.savedFix
-                ? 'These lines are too close to parallel to cross reliably. LAST FIX is still your previous fix.'
-                : 'These lines are too close to parallel to cross reliably. Try a spot where the landmarks lie further apart.');
-        }
-        else
-        {
-            legend.push('The lines cross at LAST FIX: where you stand now, until you move.');
+            const readingsLine: string[] = [];
+
+            LANDMARKS.forEach((landmark, index) => {
+                const reading = this.readings[index];
+
+                if (reading === null)
+                {
+                    return;
+                }
+
+                const from = landmark.position;
+                const back = reverseBearing(reading.bearing);
+                const end = rayExit(from, back, bounds);
+                const left = rayExit(from, back - readingHalfWidth(reading), bounds);
+                const right = rayExit(from, back + readingHalfWidth(reading), bounds);
+
+                if (left && right)
+                {
+                    const [a, b, c] = [at(from), at(left), at(right)];
+
+                    g.fillStyle(landmark.mapColor, 0.2);
+                    g.fillTriangle(a.x, a.y, b.x, b.y, c.x, c.y);
+                }
+
+                if (end)
+                {
+                    g.lineStyle(1, landmark.mapColor);
+                    line(from, end);
+                }
+
+                readingsLine.push(`${landmark.label} read ${degrees(reading.bearing)} -> line ${degrees(back)}`);
+            });
+
+            const fix = this.positionFix();
+            const recorded = readingsLine.length;
+
+            legend.push('Each coloured line runs back from its landmark towards where you stood.');
+            legend.push(recorded > 0 ? readingsLine.join('     ') : 'No bearings from here.');
+
+            if (recorded === 0)
+            {
+                legend.push(this.savedFix
+                    ? 'LAST FIX is where you stood when you took your last bearings, not where you are now.'
+                    : 'Survey a landmark (SPACE + click) in the field.');
+            }
+            else if (recorded === 1)
+            {
+                legend.push('One line: you are somewhere along it. Take another bearing from the same spot.');
+            }
+            else if (fix === null)
+            {
+                legend.push('These lines are too close to parallel to cross reliably. LAST FIX is unchanged.');
+            }
+            else
+            {
+                legend.push('The lines cross inside LAST FIX: where you stand now, until you move.');
+            }
         }
 
-        // The shelter: a small hut outline (roof triangle over a square), a destination only.
+        // The hut: a small hut outline (roof triangle over a square), a destination only.
         {
             const { x, y } = at(SHELTER.position);
 
@@ -1123,14 +1486,28 @@ export class FieldScene extends Scene
             g.fillRect(x - 2, y - 2, 4, 4);
         });
 
-        if (this.savedFix)
+        if (this.phase === 'playing' && this.savedFix)
         {
             // The last fix as it was written down: it never follows the player.
-            const { x, y } = at(this.savedFix);
+            const right = this.drawFix(this.savedFix, at);
 
-            g.lineStyle(1, FIX_MARK_COLOR);
-            g.strokeCircle(x, y, FIX_MARK_RADIUS);
-            this.mapFixLabel.setPosition(x + FIX_MARK_RADIUS + 2, y + 1);
+            this.mapFixLabel.setPosition(right.x + 3, right.y - 4);
+        }
+
+        if (this.phase === 'recall')
+        {
+            const moment = RECALL_MOMENTS[this.recallMoment];
+
+            legend.push(`RECALL  Where did you think you were: "${moment}"?  Click the map to mark it.`);
+            legend.push('TAB: next moment      ENTER: show where you really went');
+            this.drawRecallMarks(at);
+        }
+
+        if (this.phase === 'debrief')
+        {
+            this.drawDebrief(at);
+            legend.push('Red: where you really went.  Blue: slides.  Red outlines: your fixes.  Crosses: where you thought you were.');
+            legend.push('R: start again      L: save the run log');
         }
 
         this.mapLegend.setText(legend);
@@ -1140,44 +1517,190 @@ export class FieldScene extends Scene
             // Development only: the solver's answer and where the player really is.
             const { x, y } = this.position;
             const you = at(this.position);
+            const fix = this.positionFix();
 
             g.fillStyle(0xff3030);
             g.fillRect(Math.round(you.x) - 2, Math.round(you.y) - 2, 4, 4);
 
             if (fix)
             {
-                const p = at(fix);
+                const p = at(fix.point);
 
                 g.lineStyle(1, 0x000000);
                 g.lineBetween(p.x - 4, p.y - 4, p.x + 4, p.y + 4);
                 g.lineBetween(p.x - 4, p.y + 4, p.x + 4, p.y - 4);
             }
 
-            const last = this.savedFix ? `  last ${this.savedFix.x.toFixed(1)},${this.savedFix.y.toFixed(1)}` : '';
+            const last = this.savedFix ? `  last ${this.savedFix.point.x.toFixed(1)},${this.savedFix.point.y.toFixed(1)}` : '';
 
             this.mapDebug.setText((fix
-                ? `DEBUG  fix ${fix.x.toFixed(1)},${fix.y.toFixed(1)}  you ${x.toFixed(1)},${y.toFixed(1)}  err ${Math.hypot(fix.x - x, fix.y - y).toFixed(2)}px`
+                ? `DEBUG  fix ${fix.point.x.toFixed(1)},${fix.point.y.toFixed(1)}  you ${x.toFixed(1)},${y.toFixed(1)}  err ${Math.hypot(fix.point.x - x, fix.point.y - y).toFixed(2)}px`
                 : `DEBUG  no fix  you ${x.toFixed(1)},${y.toFixed(1)}`) + last);
         }
     }
 
-    /**
-     * Position worked out from both recorded readings and the landmarks' known positions only:
-     * undefined while a reading is missing, null when the two do not give a usable crossing.
-     */
-    private positionFix (): Point | null | undefined
+    /** The map's hazards: every slide zone filled and hatched, the drop beyond the walkable ground in dark ink. */
+    private drawMapHazards (at: (point: Point) => Point)
     {
-        const [first, second] = this.readings;
+        const g = this.mapGraphics;
+        const { minX, minY, maxX, maxY } = SHELF_INNER;
+        const width = gridWidth(WORLD_ELEVATION);
+        const height = gridHeight(WORLD_ELEVATION);
+        const rect = (x0: number, y0: number, x1: number, y1: number) => {
+            const a = at({ x: x0, y: y0 });
+            const b = at({ x: x1, y: y1 });
 
-        if (first === null || second === null)
+            g.fillRect(a.x, a.y, b.x - a.x, b.y - a.y);
+        };
+
+        g.fillStyle(MAP_DROP_COLOR, 0.55);
+        rect(0, 0, width, minY);
+        rect(0, maxY, width, height);
+        rect(0, minY, minX, maxY);
+        rect(maxX, minY, width, maxY);
+
+        // The edge itself, with short strokes pointing over it, like a cliff line.
+        const edge = [{ x: minX, y: minY }, { x: maxX, y: minY }, { x: maxX, y: maxY }, { x: minX, y: maxY }];
+
+        g.lineStyle(1, MAP_DROP_COLOR);
+        edge.forEach((from, i) => {
+            const to = edge[(i + 1) % edge.length];
+            const length = Math.hypot(to.x - from.x, to.y - from.y);
+            const [ux, uy] = [(to.x - from.x) / length, (to.y - from.y) / length];
+            const p = at(from);
+            const q = at(to);
+
+            g.lineBetween(p.x, p.y, q.x, q.y);
+
+            for (let d = 15; d < length; d += 30)
+            {
+                // Outward normal of a clockwise rectangle: (uy, -ux).
+                const base = at({ x: from.x + ux * d, y: from.y + uy * d });
+
+                g.lineBetween(base.x, base.y, base.x + uy * 3, base.y - ux * 3);
+            }
+        });
+
+        for (const zone of SHELF_HAZARDS)
+        {
+            if (zone.kind !== 'slide')
+            {
+                continue;
+            }
+
+            g.fillStyle(MAP_SLIDE_COLOR, 0.18);
+            fillPolygon(g, zone.polygon.map(at));
+            g.lineStyle(1, MAP_SLIDE_COLOR, 0.9);
+
+            for (const [a, b] of hatch(zone.polygon, MAP_HATCH_STEP / this.mapLayout.scale))
+            {
+                const p = at(a);
+                const q = at(b);
+
+                g.lineBetween(p.x, p.y, q.x, q.y);
+            }
+        }
+    }
+
+    /** Draws a fix as its region (or a small ring when the region cannot be worked out); returns its right-hand edge. */
+    private drawFix (fix: Fix, at: (point: Point) => Point): Point
+    {
+        const g = this.mapGraphics;
+        const centre = at(fix.point);
+
+        g.lineStyle(1, FIX_MARK_COLOR);
+
+        if (fix.region)
+        {
+            const region = fix.region.map(at);
+
+            g.fillStyle(FIX_MARK_COLOR, 0.15);
+            fillPolygon(g, region);
+            strokePolygon(g, region);
+
+            return { x: Math.max(...region.map(p => p.x)), y: centre.y };
+        }
+
+        g.strokeCircle(centre.x, centre.y, 3);
+
+        return { x: centre.x + 3, y: centre.y };
+    }
+
+    /** Recall marks: a pencil cross and the moment's label for each mark placed. */
+    private drawRecallMarks (at: (point: Point) => Point)
+    {
+        const g = this.mapGraphics;
+
+        g.lineStyle(1, RECALL_COLOR);
+
+        for (const point of this.recallMarks.values())
+        {
+            const p = at(point);
+
+            g.lineBetween(p.x - 3, p.y - 3, p.x + 3, p.y + 3);
+            g.lineBetween(p.x - 3, p.y + 3, p.x + 3, p.y - 3);
+        }
+    }
+
+    /** Debrief: the true track (slides in blue), every fix region, the recall marks and where the run ended. */
+    private drawDebrief (at: (point: Point) => Point)
+    {
+        const g = this.mapGraphics;
+        const path = this.log.path.map(at);
+
+        g.lineStyle(1, TRACK_COLOR);
+
+        for (let i = 1; i < path.length; i++)
+        {
+            g.lineBetween(path[i - 1].x, path[i - 1].y, path[i].x, path[i].y);
+        }
+
+        g.lineStyle(2, SLIDE_TRACK_COLOR);
+
+        for (const event of this.log.events)
+        {
+            if (event.type === 'slide-end' && Array.isArray(event.path))
+            {
+                const points = (event.path as [number, number][]).map(([x, y]) => at({ x, y }));
+
+                for (let i = 1; i < points.length; i++)
+                {
+                    g.lineBetween(points[i - 1].x, points[i - 1].y, points[i].x, points[i].y);
+                }
+            }
+        }
+
+        this.fixes.forEach(fix => this.drawFix(fix, at));
+        this.drawRecallMarks(at);
+
+        const end = at(this.position);
+
+        g.lineStyle(2, TRACK_COLOR);
+        g.strokeCircle(end.x, end.y, 3);
+    }
+
+    /**
+     * Position worked out from the recorded readings and the landmarks' known positions only: the
+     * pair of readings whose lines cross most squarely (see bestPair), with the region their
+     * uncertainty allows. Undefined while fewer than two readings exist, null when none cross usably.
+     */
+    private positionFix (): Fix | null | undefined
+    {
+        const observations = LANDMARKS.flatMap((landmark, index) => {
+            const reading = this.readings[index];
+
+            return reading ? [{ landmark: landmark.position, bearing: reading.bearing, halfWidth: readingHalfWidth(reading) }] : [];
+        });
+
+        if (observations.length < 2)
         {
             return undefined;
         }
 
-        return triangulate(
-            { landmark: LANDMARKS[0].position, bearing: first.bearing },
-            { landmark: LANDMARKS[1].position, bearing: second.bearing }
-        );
+        const pair = bestPair(observations);
+        const point = pair && triangulate(pair[0], pair[1]);
+
+        return pair && point ? { point, region: fixRegion(pair[0], pair[1]) } : null;
     }
 
     private createFog (width: number, height: number)
@@ -1278,7 +1801,7 @@ export class FieldScene extends Scene
                 ? `white ${this.whiteout.toFixed(2)} sight ${sightDistance(this.whiteout).toFixed(0)}px`
                 : 'view  unlimited',
             this.fixErrorLine(),
-            `start ${this.startIndex}  H player view  E/C/V debug  SPACE survey`
+            `H player view  E/C/V debug  SPACE survey  L log`
         ]);
     }
 
@@ -1292,7 +1815,7 @@ export class FieldScene extends Scene
             return 'fix   --';
         }
 
-        return fix ? `fix   err ${Math.hypot(fix.x - this.position.x, fix.y - this.position.y).toFixed(2)}px` : 'fix   rejected';
+        return fix ? `fix   err ${Math.hypot(fix.point.x - this.position.x, fix.point.y - this.position.y).toFixed(2)}px` : 'fix   rejected';
     }
 
     /** Draws the landmark into the scene below the fog; FieldScene decides when it is shown. */
@@ -1332,31 +1855,35 @@ export class FieldScene extends Scene
 
     /**
      * Player-view ground: snow shaded by local form (see SNOW_COLOR), baked once into a world-sized
-     * image, with the repeating speck-and-streak tile over it.
+     * image, with an even rock cast on the rock band (see ROCK_RGB) and the drop beyond the walkable
+     * ground darkened. Nothing smaller than the terrain's own form is drawn.
      */
     private drawSnow (width: number, height: number)
     {
-        for (const key of [SNOW_FIELD_TEXTURE, SNOW_TEXTURE])
+        if (this.textures.exists(SNOW_FIELD_TEXTURE))
         {
-            if (this.textures.exists(key))
-            {
-                this.textures.remove(key);
-            }
+            this.textures.remove(SNOW_FIELD_TEXTURE);
         }
 
         const columns = Math.ceil(width / SNOW_CELL);
         const rows = Math.ceil(height / SNOW_CELL);
         const field = this.textures.createCanvas(SNOW_FIELD_TEXTURE, columns, rows);
-        const tile = this.textures.createCanvas(SNOW_TEXTURE, SNOW_TILE, SNOW_TILE);
 
-        if (!field || !tile)
+        if (!field)
         {
-            throw new Error('Could not create the snow textures.');
+            throw new Error(`Could not create the ${SNOW_FIELD_TEXTURE} texture.`);
         }
 
         const base = [(SNOW_COLOR >> 16) & 0xff, (SNOW_COLOR >> 8) & 0xff, SNOW_COLOR & 0xff];
         const mix = (from: number[], to: number[], t: number) => from.map((value, i) => value + (to[i] - value) * t);
+        const smooth = (t: number) => {
+            const c = clamp(t, 0, 1);
+
+            return c * c * (3 - 2 * c);
+        };
         const image = field.context.createImageData(columns, rows);
+        // The rock band is an upright rectangle.
+        const band = { left: Math.min(...ROCK_BAND.map(p => p.x)), right: Math.max(...ROCK_BAND.map(p => p.x)), top: Math.min(...ROCK_BAND.map(p => p.y)), bottom: Math.max(...ROCK_BAND.map(p => p.y)) };
 
         for (let row = 0; row < rows; row++)
         {
@@ -1374,6 +1901,24 @@ export class FieldScene extends Scene
                 colour = mix(colour, SNOW_SCOURED, 0.55 * Math.min(1, form.slope / SNOW_STEEP));
                 colour = hollow > 0 ? mix(colour, SNOW_DRIFT, 0.25 * hollow) : mix(colour, SNOW_LIT, -0.2 * hollow);
 
+                // Rock showing through the steep face of the rock band, still lit and shaded by its form.
+                // Each fade runs across the band's edge, from half its width outside to half inside.
+                const sides = smooth(Math.min(x - band.left, band.right - x) / ROCK_FADE_X + 0.5);
+                const topAndBottom = smooth(Math.min(y - band.top, band.bottom - y) / ROCK_FADE_Y + 0.5);
+
+                if (sides > 0 && topAndBottom > 0)
+                {
+                    const steep = smooth((form.slope - ROCK_STEEP_FROM) / (ROCK_STEEP_FULL - ROCK_STEEP_FROM));
+
+                    colour = mix(colour, ROCK_RGB, ROCK_COVER * sides * topAndBottom * steep);
+                }
+
+                // Beyond the edge the mountain drops away: dark, deepening over the first 24px.
+                if (distanceToDrop({ x, y }) < 0)
+                {
+                    colour = mix(colour, DROP_RGB, Math.min(1, 0.6 - distanceToDrop({ x, y }) / 24));
+                }
+
                 const i = (row * columns + column) * 4;
 
                 image.data[i] = Math.round(colour[0]);
@@ -1386,15 +1931,6 @@ export class FieldScene extends Scene
         field.context.putImageData(image, 0, 0);
         field.refresh();
         this.add.image(0, 0, SNOW_FIELD_TEXTURE).setOrigin(0, 0).setScale(SNOW_CELL);
-
-        tile.context.clearRect(0, 0, SNOW_TILE, SNOW_TILE);
-        tile.context.fillStyle = SNOW_STREAK_COLOR;
-        SNOW_STREAKS.forEach(([x, y, length]) => tile.context.fillRect(x, y, length, 1));
-        tile.context.fillStyle = SNOW_SPECK_COLOR;
-        SNOW_SPECKS.forEach(([x, y]) => tile.context.fillRect(x, y, 1, 1));
-        tile.refresh();
-
-        this.add.tileSprite(0, 0, width, height, SNOW_TEXTURE).setOrigin(0, 0);
     }
 
     /** Bakes the elevation field into a greyscale texture: brighter is higher. */

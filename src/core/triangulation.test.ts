@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { Point } from './geometry';
 import { bearingTo } from './survey';
-import { MIN_INTERSECTION_ANGLE, reverseBearing, triangulate } from './triangulation';
+import { bestPair, fixRegion, MIN_INTERSECTION_ANGLE, reverseBearing, triangulate } from './triangulation';
 
 /** Bearings an observer at `player` would read; only these and the landmark positions reach the solver. */
 const observe = (player: Point, landmark: Point) => ({ landmark, bearing: bearingTo(player, landmark) as number });
@@ -124,5 +124,35 @@ describe('triangulate', () => {
                 }
             }
         }
+    });
+});
+
+describe('fixRegion', () => {
+    it('surrounds the exact fix with the four corners where the reading wedges cross', () => {
+        const player = { x: 100, y: 100 };
+        const a = { landmark: { x: 100, y: 20 }, bearing: 0, halfWidth: 2 };
+        const b = { landmark: { x: 180, y: 100 }, bearing: 90, halfWidth: 3 };
+        const region = fixRegion(a, b)!;
+
+        expect(region).toHaveLength(4);
+        expect(Math.min(...region.map(p => p.x))).toBeLessThan(player.x);
+        expect(Math.max(...region.map(p => p.x))).toBeGreaterThan(player.x);
+        expect(Math.min(...region.map(p => p.y))).toBeLessThan(player.y);
+        expect(Math.max(...region.map(p => p.y))).toBeGreaterThan(player.y);
+    });
+
+    it('gives no region when the wedges are too close to parallel', () => {
+        expect(fixRegion({ landmark: { x: 200, y: 100 }, bearing: 90, halfWidth: 5 }, { landmark: { x: 300, y: 105 }, bearing: 92, halfWidth: 5 })).toBeNull();
+    });
+});
+
+describe('bestPair', () => {
+    it('picks the pair whose lines cross most nearly at right angles', () => {
+        const north = { landmark: { x: 100, y: 0 }, bearing: 0 };
+        const east = { landmark: { x: 200, y: 100 }, bearing: 90 };
+        const northEast = { landmark: { x: 170, y: 30 }, bearing: 45 };
+
+        expect(bestPair([north, northEast, east])).toEqual([north, east]);
+        expect(bestPair([north])).toBeNull();
     });
 });

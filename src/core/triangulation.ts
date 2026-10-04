@@ -70,3 +70,52 @@ export function triangulate (first: Observation, second: Observation): Point | n
 
     return { x: first.landmark.x + s * u.x, y: first.landmark.y + s * u.y };
 }
+
+/** An observation read to within `halfWidth` degrees either side of its bearing. */
+export interface WideObservation extends Observation
+{
+    readonly halfWidth: number;
+}
+
+/**
+ * Where the observer may stand given both observations' uncertainty: the four corners where the
+ * edges of the two reading wedges cross, in order round the region. Null when any pair of edges
+ * fails to give a usable crossing (see triangulate).
+ */
+export function fixRegion (first: WideObservation, second: WideObservation): Point[] | null
+{
+    const corner = (a: number, b: number) => triangulate(
+        { landmark: first.landmark, bearing: first.bearing + a * first.halfWidth },
+        { landmark: second.landmark, bearing: second.bearing + b * second.halfWidth }
+    );
+    const corners = [corner(-1, -1), corner(-1, 1), corner(1, 1), corner(1, -1)];
+
+    return corners.every(point => point !== null) ? corners as Point[] : null;
+}
+
+/**
+ * Of several observations taken from one spot, the two whose sight lines cross most nearly at
+ * right angles and still give a fix (see triangulate), or null when no pair does.
+ */
+export function bestPair<T extends Observation> (observations: readonly T[]): [T, T] | null
+{
+    let best: [T, T] | null = null;
+    let bestSine = 0;
+
+    for (let i = 0; i < observations.length; i++)
+    {
+        for (let j = i + 1; j < observations.length; j++)
+        {
+            const [a, b] = [observations[i], observations[j]];
+            const sine = Math.abs(Math.sin((a.bearing - b.bearing) * Math.PI / 180));
+
+            if (sine > bestSine && triangulate(a, b) !== null)
+            {
+                best = [a, b];
+                bestSine = sine;
+            }
+        }
+    }
+
+    return best;
+}

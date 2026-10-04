@@ -12,6 +12,9 @@ import { visibility } from './visibility';
  */
 export const SURVEY_TOLERANCE = 2;
 
+/** The survey instrument sees this many times as far as the eye under the same whiteout. */
+export const SURVEY_RANGE_FACTOR = 1.75;
+
 /** How clearly (0..1, from `visibility`) a target must be seen before it can be surveyed. */
 export const SURVEY_MIN_VISIBILITY = 0.5;
 
