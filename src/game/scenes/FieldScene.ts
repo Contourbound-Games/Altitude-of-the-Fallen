@@ -71,14 +71,22 @@ const DRIFTED_SNOW: Paint = [0xeef1f3, 0.9];
 const DRIFT_SHADE: Paint = [0x8a9bb0, 0.3];
 
 /**
- * The two prototype landmarks, each recognisable by one saturated colour among muted ones.
+ * The two prototype landmarks: two fallen climbers, told apart by pose first and by one saturated
+ * colour among muted ones second.
  *
- * Karel, a fallen climber, lies face down with his head to the west: grey helmet (H, shaded h),
- * dark jacket (J, j) under a muted pack (P), dark gloves (W) and trousers (L). His right arm is
- * crooked up over his helmet, his left arm is buried in a drift (S, its lee edge s), and his legs
- * are splayed, the left one bent at the knee. His green boots (G, shaded g) are the only saturated colour on him: the hook that
- * makes him recognisable, kept to six pixels each so they stay exceptional rather than a beacon.
- * Through the instrument he is a low dark shape on the snow with the green boots raised at one end.
+ * Karel lies face down with his head to the west: grey helmet (H, shaded h), dark jacket (J, j)
+ * under a muted pack (P), dark gloves (W) and trousers (L). His right arm is crooked up over his
+ * helmet, his left arm is buried in a drift (S, its lee edge s), and his legs are splayed, the left
+ * one bent at the knee. His green boots (G, shaded g) are the only saturated colour on him: the
+ * hook that makes him recognisable, kept to six pixels each so they stay exceptional rather than a
+ * beacon. Through the instrument he is a long, low dark shape with the green boots raised at one end.
+ *
+ * Corpse B (no name yet) lies curled on one side with the head to the north: a dark hood (K) with
+ * a pale fur ruff (F) round the face (f), an olive-grey down suit (D) and an orange pack (O, shaded
+ * o) on the back, facing west. One arm (W) rests on the drawn-up knees; the upper leg (L) is bent
+ * hard with its boot (B) forward, the lower leg (l) half buried in a drift. Compact and upright
+ * where Karel is long and sprawled; the orange pack is its only saturated colour. Through the
+ * instrument it is a short, rounded hump capped with orange.
  *
  * Each radius is the half-length of the original prototype sprite, so aiming is unchanged.
  */
@@ -114,28 +122,40 @@ const LANDMARKS: readonly [SurveyLandmark, SurveyLandmark] = [
         radius: 6
     },
     {
-        // A marker flag on a few rocks: P pole, M magenta flag, R rocks, with snow on the rocks.
-        label: 'FLAG',
+        label: 'CORPSE B',
         position: { x: 790, y: 590 },
         pixels: [
-            '.PMMMM',
-            '.PMMMM',
-            '.PMMM.',
-            '.P....',
-            '.P....',
-            'RSRR..',
-            '.cccc.'
+            '...KKKF.........',
+            '..KKKFfF........',
+            '..KKKFfFc.......',
+            '...KKFFcc.......',
+            '..OODDDc........',
+            '.OOODDDDW.......',
+            '.OOODDDDWc......',
+            '.OOoDDDDcW......',
+            '.ooDDDDDcWW.....',
+            '..DDDDLLLLLLL...',
+            '..sDDLLLLLLLLL..',
+            '...SSlllllccLLL.',
+            '...SSSllllc.LLLc',
+            '....SSSlllc.LLLc',
+            '.....SSsBBc.BBBc',
+            '.........cc.BBBc',
+            '.............ccc'
         ],
         profile: [
-            '.PMMMM',
-            '.PMMMM',
-            '.PMMM.',
-            '.P....',
-            '.P....',
-            'RSRR..'
+            '...OO.....',
+            '..OOOO....',
+            '.FOOOODLL.',
+            'FfKDDDDLLL',
+            'KKDDDDDLLB',
+            'SSSSSSSSSS'
         ],
-        colors: { P: 0x2a2d33, M: 0xe23cb4, R: 0x6e6a64, S: DRIFTED_SNOW, c: CONTACT_SHADOW },
-        mapColor: 0xb0108e,
+        colors: {
+            K: 0x4a4038, F: 0xc9bfae, f: 0x8a8366, D: 0x6b6c58, O: 0xd8642a, o: 0x9a4320, W: 0x1f2226,
+            L: 0x4a443d, l: 0x38332e, B: 0x3a3633, S: DRIFTED_SNOW, s: DRIFT_SHADE, c: CONTACT_SHADOW
+        },
+        mapColor: 0xb4501a,
         radius: 3
     }
 ];
@@ -164,7 +184,7 @@ const SHELTER: Landmark = {
 const SHELTER_REACH = 10;
 
 /**
- * In the top-down field Karel and the Flag are drawn only this close (world px), so the field cannot
+ * In the top-down field Karel and Corpse B are drawn only this close (world px), so the field cannot
  * be used as a rangefinder: from further off they are observed in the Survey View, by bearing only.
  * Standing this close to a known landmark is allowed to tell the player roughly where they are.
  *
